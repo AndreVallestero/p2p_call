@@ -25,6 +25,9 @@ pip install sounddevice numpy opuslib
 ```
 
 > Windows also needs `opus.dll` (libopus) on `PATH` or next to `p2p_call.py`.
+> Download it here: https://github.com/ShiftMediaProject/opus/releases
+> (e.g. `libopus_v1.4_msvc17.zip` — use the 64-bit `opus.dll`).
+> Official builds are also listed at https://opus-codec.org/downloads/.
 
 ## Run
 
