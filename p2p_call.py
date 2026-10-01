@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import configparser
 import ctypes
 import ctypes.util
 import os
@@ -160,6 +161,68 @@ SEQ_HALF = 0x80000000
 MAX_OPUS_BYTES = 4000  # plenty for 2.5 ms @ 98304 bps (~31 B typical)
 DEFAULT_PORT = 8192
 DEFAULT_BUFFER = 8
+DEFAULT_ADDRESS = "127.0.0.1"
+
+CONFIG_SECTION = "p2p_call"
+
+
+def _config_path() -> Path:
+    try:
+        return Path(__file__).resolve().parent / "p2p_call.ini"
+    except Exception:
+        return Path("p2p_call.ini")
+
+
+def load_config() -> dict:
+    """Read p2p_call.ini (active tab's mode/port/buffer). Never raises.
+
+    Returns {} when the file is missing or invalid; values are range-checked.
+    """
+    cfg: dict = {}
+    cp = configparser.ConfigParser()
+    try:
+        if not cp.read(_config_path(), encoding="utf-8"):
+            return cfg
+        if not cp.has_section(CONFIG_SECTION):
+            return cfg
+        mode = cp.get(CONFIG_SECTION, "mode", fallback="").strip().lower()
+        if mode in ("host", "peer"):
+            cfg["mode"] = mode
+        try:
+            port = cp.getint(CONFIG_SECTION, "port", fallback=-1)
+        except ValueError:
+            port = -1
+        if 1 <= port <= 65535:
+            cfg["port"] = port
+        try:
+            buffer = cp.getint(CONFIG_SECTION, "buffer", fallback=-1)
+        except ValueError:
+            buffer = -1
+        if 1 <= buffer <= 64:
+            cfg["buffer"] = buffer
+        address = cp.get(CONFIG_SECTION, "address", fallback="").strip()
+        if address:
+            cfg["address"] = address
+    except Exception:
+        return {}
+    return cfg
+
+
+def save_config(mode: str, port: int, buffer: int, address: str = "") -> bool:
+    """Persist the active tab's settings. Returns False on write failure."""
+    cp = configparser.ConfigParser()
+    cp[CONFIG_SECTION] = {
+        "mode": mode,
+        "port": str(port),
+        "buffer": str(buffer),
+        "address": address,
+    }
+    try:
+        with open(_config_path(), "w", encoding="utf-8") as f:
+            cp.write(f)
+        return True
+    except OSError:
+        return False
 
 # --------------------------------------------------------------------------
 # Seq helpers (uint32 wrap-aware)
@@ -823,6 +886,8 @@ def run_gui() -> int:
         host_btn.config(text="Stop")
         peer_btn.config(text="Start", state="disabled")
         host_status.config(text=f"Hosting on :{p} (fb={fb}) — waiting for peer…")
+        if not save_config("host", p, fb):
+            log("Could not save p2p_call.ini")
 
     def on_peer_toggle():
         c = calls["active"]
@@ -871,11 +936,43 @@ def run_gui() -> int:
         peer_btn.config(text="Stop")
         host_btn.config(text="Start", state="disabled")
         peer_status.config(text=f"Calling {host}:{pp} (fb={fb})…")
+        if not save_config("peer", pp, fb, host):
+            log("Could not save p2p_call.ini")
 
     host_btn.config(command=on_host_toggle)
     peer_btn.config(command=on_peer_toggle)
 
+    # ---- restore last session (active tab's mode/port/buffer) ----
+    try:
+        _cfg = load_config()
+        if _cfg.get("mode") == "host":
+            if "port" in _cfg:
+                host_port.set(str(_cfg["port"]))
+            if "buffer" in _cfg:
+                host_fb.set(str(_cfg["buffer"]))
+            nb.select(host_frame)
+        elif _cfg.get("mode") == "peer":
+            if "address" in _cfg:
+                peer_addr.set(_cfg["address"])
+            if "port" in _cfg:
+                peer_port.set(str(_cfg["port"]))
+            if "buffer" in _cfg:
+                peer_fb.set(str(_cfg["buffer"]))
+            nb.select(peer_frame)
+    except Exception as ex:
+        log(f"Config restore failed: {ex}")
+
     def on_close():
+        # Persist the currently visible tab's settings.
+        try:
+            if nb.index(nb.select()) == 0:
+                save_config("host", int(host_port.get().strip()),
+                            int(host_fb.get().strip()))
+            else:
+                save_config("peer", int(peer_port.get().strip()),
+                            int(peer_fb.get().strip()), peer_addr.get().strip())
+        except (ValueError, AttributeError):
+            pass
         try:
             stop_active()
         finally:
@@ -901,15 +998,22 @@ def run_cli(args) -> int:
             return 2
         print(sd.query_devices())
         return 0
-    if args.mode == "host":
-        call = P2PCall("host", port=args.port, frame_buffer=args.buffer,
+    # Config supplies defaults; explicit CLI flags win. Mode itself defaults
+    # to the saved mode so `python p2p_call.py --cli` resumes the last session.
+    cfg = load_config() if args.mode is None or args.port is None or args.buffer is None or args.address is None else {}
+    mode = args.mode or cfg.get("mode")
+    port = args.port if args.port is not None else cfg.get("port", DEFAULT_PORT)
+    buffer = args.buffer if args.buffer is not None else cfg.get("buffer", DEFAULT_BUFFER)
+    if args.mode == "host" or (args.mode is None and mode == "host"):
+        call = P2PCall("host", port=port, frame_buffer=buffer,
                        log=lambda m: print(m, flush=True))
-    elif args.mode == "peer":
-        if not args.address:
+    elif args.mode == "peer" or (args.mode is None and mode == "peer"):
+        address = args.address or cfg.get("address")
+        if not address:
             print("--address required for peer mode", file=sys.stderr)
             return 2
-        host, pp = parse_peer_address(args.address, args.port)
-        call = P2PCall("peer", port=pp, address=host, frame_buffer=args.buffer,
+        host, pp = parse_peer_address(address, port)
+        call = P2PCall("peer", port=pp, address=host, frame_buffer=buffer,
                        log=lambda m: print(m, flush=True))
     else:
         print("No --mode given; launching GUI...", flush=True)
@@ -938,9 +1042,11 @@ def run_cli(args) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="P2P Opus LOWDELAY voice call")
     ap.add_argument("--mode", choices=["host", "peer"], default=None)
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--port", type=int, default=None,
+                    help=f"UDP port (default: saved value or {DEFAULT_PORT})")
     ap.add_argument("--address", default=None, help="Peer: host or host:port")
-    ap.add_argument("--buffer", type=int, default=DEFAULT_BUFFER, help="Frame buffer (frames)")
+    ap.add_argument("--buffer", type=int, default=None,
+                    help=f"Frame buffer in frames (default: saved value or {DEFAULT_BUFFER})")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--cli", action="store_true", help="Force CLI even if GUI available")
     ns = ap.parse_args(argv)
