@@ -33,12 +33,117 @@ from __future__ import annotations
 
 import argparse
 import collections
+import ctypes
+import ctypes.util
+import os
 import queue
 import socket
 import struct
 import sys
 import threading
 import time
+from pathlib import Path
+
+
+_OPUS_DLL_NAMES = ("opus.dll", "libopus.dll", "libopus-0.dll")
+_opus_dll_patched = False
+
+
+def _ensure_opus_dll() -> str | None:
+    """Make opuslib's ``find_library('opus')`` work on Windows.
+
+    opuslib locates libopus via ``ctypes.util.find_library('opus')``, which
+    searches PATH / system dirs but NOT the script's directory (Python 3.8+
+    removed CWD/script-dir from DLL search). So ``opus.dll`` sitting next to
+    ``p2p_call.py`` was ignored.
+
+    This puts the script dir (plus CWD / interpreter dir / PyInstaller
+    bundle dir) on the DLL search path and patches ``ctypes.util.find_library``
+    to resolve ``'opus'`` to the local DLL. Must run BEFORE ``import opuslib``.
+    Returns the DLL path or None. Harmless on Linux (system libopus is used).
+    """
+    global _opus_dll_patched
+    orig_find = ctypes.util.find_library
+    try:
+        if orig_find("opus"):
+            return orig_find("opus")  # already discoverable, nothing to do
+    except Exception:
+        pass
+
+    search_dirs: list[str] = []
+    try:
+        search_dirs.append(str(Path(__file__).resolve().parent))
+    except Exception:
+        pass
+    try:
+        search_dirs.append(os.getcwd())
+    except Exception:
+        pass
+    try:
+        search_dirs.append(str(Path(sys.executable).resolve().parent))
+    except Exception:
+        pass
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        search_dirs.append(str(bundle))
+
+    found: str | None = None
+    for d in search_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        # 1) Put the dir on the DLL search path (needed on Win 3.8+).
+        try:
+            if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(d)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if d not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+        except Exception:
+            pass
+        # 2) Look for a DLL file here.
+        if found is None:
+            for name in _OPUS_DLL_NAMES:
+                cand = os.path.join(d, name)
+                if os.path.isfile(cand):
+                    found = cand
+                    break
+        # 3) Re-check system search now that PATH was extended.
+        try:
+            if orig_find("opus"):
+                found = found or orig_find("opus")
+                break
+        except Exception:
+            pass
+        if found:
+            break
+
+    # 4) Patch find_library so opuslib (imported AFTER this) resolves 'opus'
+    #    to the local DLL even if its own search would miss the script dir.
+    if found and not _opus_dll_patched:
+        try:
+            def _patched_find(name, _orig=orig_find, _found=found):
+                try:
+                    if str(name).lower() in ("opus", "libopus", "opus.dll",
+                                             "libopus.dll", "libopus-0.dll"):
+                        return _found
+                    r = _orig(name)
+                    return r if r else (_found if str(name).lower() == "opus" else None)
+                except Exception:
+                    return _found
+            ctypes.util.find_library = _patched_find  # type: ignore[method-assign]
+            _opus_dll_patched = True
+        except Exception:
+            pass
+    return found
+
+
+# Run at import time so even `import opuslib` after `import p2p_call` benefits.
+_ensure_opus_dll()
 
 # --------------------------------------------------------------------------
 # Constants
@@ -78,11 +183,18 @@ class OpusCodec:
     """Opus encoder/decoder fixed to spec. Not thread-safe; use from one thread."""
 
     def __init__(self, bitrate: int = BITRATE):
+        # Must precede `import opuslib`: it calls find_library('opus') at import.
+        _ensure_opus_dll()
         try:
             import opuslib
         except Exception as ex:
             raise RuntimeError(
-                "opuslib not installed. Run: pip install opuslib\n"
+                "Could not load the Opus library.\n"
+                "Windows: put 64-bit opus.dll (matching your Python) next to "
+                "p2p_call.py — see README troubleshooting. "
+                "Download: https://github.com/ShiftMediaProject/opus/releases\n"
+                "Linux: sudo apt install libopus0 (Debian) / "
+                "sudo pacman -S opus (Arch).\n"
                 f"Underlying error: {ex}"
             ) from ex
         self._opuslib = opuslib
