@@ -62,14 +62,19 @@ def _ensure_opus_dll() -> str | None:
     bundle dir) on the DLL search path and patches ``ctypes.util.find_library``
     to resolve ``'opus'`` to the local DLL. Must run BEFORE ``import opuslib``.
     Returns the DLL path or None. Harmless on Linux (system libopus is used).
+
+    NOTE: a *bare* filename from the system search (e.g. ``opus.dll`` with no
+    directory) is NOT trusted on its own: on Windows ``ctypes.CDLL`` with a
+    bare name does not search the script dir / CWD, so opuslib would fail with
+    "Could not find module 'opus.dll'" even though ``find_library`` claimed to
+    find it. We always resolve to a full path when a matching file exists.
     """
     global _opus_dll_patched
     orig_find = ctypes.util.find_library
     try:
-        if orig_find("opus"):
-            return orig_find("opus")  # already discoverable, nothing to do
+        sys_loc = orig_find("opus")
     except Exception:
-        pass
+        sys_loc = None
 
     search_dirs: list[str] = []
     try:
@@ -88,11 +93,11 @@ def _ensure_opus_dll() -> str | None:
     if bundle:
         search_dirs.append(str(bundle))
 
-    found: str | None = None
+    # 1) Always register search dirs (needed on Win 3.8+ for the DLL *and*
+    #    its own dependencies), even if the system search already resolves.
     for d in search_dirs:
         if not d or not os.path.isdir(d):
             continue
-        # 1) Put the dir on the DLL search path (needed on Win 3.8+).
         try:
             if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
                 try:
@@ -106,25 +111,35 @@ def _ensure_opus_dll() -> str | None:
                 os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
         except Exception:
             pass
-        # 2) Look for a DLL file here.
-        if found is None:
-            for name in _OPUS_DLL_NAMES:
-                cand = os.path.join(d, name)
-                if os.path.isfile(cand):
-                    found = cand
-                    break
-        # 3) Re-check system search now that PATH was extended.
-        try:
-            if orig_find("opus"):
-                found = found or orig_find("opus")
+
+    # 2) Prefer a full path to an actual file over a bare filename.
+    found: str | None = None
+    for d in search_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for name in _OPUS_DLL_NAMES:
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand):
+                found = cand
                 break
-        except Exception:
-            pass
         if found:
             break
+    if found is None and sys_loc:
+        if os.path.isabs(sys_loc) and os.path.isfile(sys_loc):
+            found = sys_loc
+        elif sys_loc and not os.path.dirname(sys_loc):
+            # Bare filename: resolve it against PATH to a full path so the
+            # loader does not depend on CWD-sensitive search semantics.
+            for pdir in os.environ.get("PATH", "").split(os.pathsep):
+                cand = os.path.join(pdir.strip('"'), sys_loc)
+                if pdir and os.path.isfile(cand):
+                    found = cand
+                    break
+        else:
+            found = sys_loc
 
-    # 4) Patch find_library so opuslib (imported AFTER this) resolves 'opus'
-    #    to the local DLL even if its own search would miss the script dir.
+    # 3) Patch find_library so opuslib (imported AFTER this) resolves 'opus'
+    #    to the full-path DLL.
     if found and not _opus_dll_patched:
         try:
             def _patched_find(name, _orig=orig_find, _found=found):
@@ -140,7 +155,7 @@ def _ensure_opus_dll() -> str | None:
             _opus_dll_patched = True
         except Exception:
             pass
-    return found
+    return found or sys_loc
 
 
 # Run at import time so even `import opuslib` after `import p2p_call` benefits.
@@ -1126,7 +1141,88 @@ def run_gui() -> int:
 # Headless CLI (fallback when tkinter missing + useful for tests)
 # --------------------------------------------------------------------------
 
+def run_check_opus() -> int:
+    """Diagnostic dump for opus.dll problems (mainly Windows). Debug-only."""
+    print(f"platform={sys.platform} python={sys.version.split()[0]} "
+          f"bitness={struct.calcsize('P') * 8}-bit exe={sys.executable}")
+    dirs = []
+    try:
+        dirs.append(("script-dir", str(Path(__file__).resolve().parent)))
+    except Exception as ex:
+        print(f"script-dir: <unresolvable: {ex}>")
+    try:
+        dirs.append(("cwd", os.getcwd()))
+    except Exception as ex:
+        print(f"cwd: <unresolvable: {ex}>")
+    try:
+        dirs.append(("exe-dir", str(Path(sys.executable).resolve().parent)))
+    except Exception as ex:
+        print(f"exe-dir: <unresolvable: {ex}>")
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        dirs.append(("bundle", str(bundle)))
+    for label, d in dirs:
+        print(f"[{label}] {d}")
+        if not os.path.isdir(d):
+            print("  (not a directory)")
+            continue
+        try:
+            dlls = sorted(f for f in os.listdir(d) if f.lower().endswith(".dll"))
+        except Exception as ex:
+            print(f"  (cannot list: {ex})")
+            continue
+        if not dlls:
+            print("  (no .dll files)")
+            continue
+        for f in dlls:
+            full = os.path.join(d, f)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = -1
+            try:
+                ctypes.CDLL(full)
+                print(f"  {f} ({size} bytes): LOADS OK")
+            except Exception as ex:
+                # The detail matters: WinError 126 = missing *dependency* of
+                # this DLL (MSVC runtime / MinGW siblings), 193 = bitness
+                # mismatch (32-bit DLL vs 64-bit Python or vice versa).
+                print(f"  {f} ({size} bytes): LOAD FAILED: {type(ex).__name__}: {ex}")
+    print(f"find_library('opus') -> {ctypes.util.find_library('opus')}")
+    # Bare-name probe FIRST (Windows only): this is exactly what opuslib does
+    # (CDLL(find_library(...))). A bare filename loads via Windows DLL search,
+    # which excludes the script dir / CWD — unlike the full-path loads below,
+    # which always work and would otherwise mask this failure.
+    if sys.platform == "win32":
+        try:
+            ctypes.CDLL("opus.dll")
+            print("bare-name CDLL('opus.dll') -> LOADS OK")
+        except Exception as ex:
+            print(f"bare-name CDLL('opus.dll') -> FAILED: {type(ex).__name__}: {ex}")
+    print(f"_ensure_opus_dll() -> {_ensure_opus_dll()}")
+    print(f"patched find_library('opus') -> {ctypes.util.find_library('opus')}")
+    try:
+        import tkinter
+        print(f"tkinter OK (Tk {tkinter.TkVersion})")
+    except Exception as ex:
+        print(f"tkinter MISSING: {ex}")
+    try:
+        import sounddevice as sd
+        print(f"sounddevice OK, PortAudio {sd.get_portaudio_version()[1]}")
+    except Exception as ex:
+        print(f"sounddevice FAILED: {ex}")
+    try:
+        c = OpusCodec()
+        print(f"OpusCodec OK: bitrate={c.actual_bitrate} vbr={c.actual_vbr}")
+        return 0
+    except Exception as ex:
+        print(f"OpusCodec FAILED:\n{ex}")
+        return 1
+
+
 def run_cli(args) -> int:
+    if getattr(args, "check_opus", False):
+        return run_check_opus()
     if args.list_devices:
         try:
             import sounddevice as sd
@@ -1198,9 +1294,11 @@ def main(argv=None) -> int:
     ap.add_argument("--password", default=None,
                     help="Shared password for AES-256-GCM (default: saved value or none)")
     ap.add_argument("--list-devices", action="store_true")
+    ap.add_argument("--check-opus", action="store_true",
+                    help="Diagnose opus.dll loading (Windows troubleshooting)")
     ap.add_argument("--cli", action="store_true", help="Force CLI even if GUI available")
     ns = ap.parse_args(argv)
-    if ns.cli or ns.mode is not None or ns.list_devices:
+    if ns.cli or ns.mode is not None or ns.list_devices or ns.check_opus:
         return run_cli(ns)
     # Default: GUI.
     try:
