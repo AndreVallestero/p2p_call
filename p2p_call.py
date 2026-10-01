@@ -162,8 +162,35 @@ MAX_OPUS_BYTES = 4000  # plenty for 2.5 ms @ 98304 bps (~31 B typical)
 DEFAULT_PORT = 8192
 DEFAULT_BUFFER = 8
 DEFAULT_ADDRESS = "127.0.0.1"
+DEFAULT_VOLUME = 100  # percent (0-200)
+
+# AES-256-GCM transport. Nonce = prefix + packet seq (never repeats per key,
+# zero wire overhead); seq bytes are also the AAD so spliced packets fail auth.
+GCM_TAG_LEN = 16
+GCM_NONCE_PREFIX = b"p2p-call"  # 8 bytes -> 12-byte nonce with BE uint32 seq
+KDF_SALT = b"p2p_call-opus-v1"
+KDF_ITERATIONS = 100000
 
 CONFIG_SECTION = "p2p_call"
+
+
+def derive_opus_key(password: str) -> bytes:
+    """PBKDF2-HMAC-SHA256(password) -> 32-byte AES key. Raises RuntimeError."""
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    except ImportError as ex:
+        raise RuntimeError(
+            "Encryption needs the 'cryptography' package. "
+            "Run: pip install cryptography"
+        ) from ex
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                     salt=KDF_SALT, iterations=KDF_ITERATIONS)
+    return kdf.derive(password.encode("utf-8"))
+
+
+def gcm_nonce(seq: int) -> bytes:
+    return GCM_NONCE_PREFIX + SEQ_STRUCT.pack(seq & SEQ_MASK)
 
 
 def _config_path() -> Path:
@@ -173,8 +200,16 @@ def _config_path() -> Path:
         return Path("p2p_call.ini")
 
 
+def _get_valid_int(cp: configparser.ConfigParser, key: str, lo: int, hi: int) -> int | None:
+    try:
+        v = cp.getint(CONFIG_SECTION, key, fallback=-1)
+    except ValueError:
+        return None
+    return v if lo <= v <= hi else None
+
+
 def load_config() -> dict:
-    """Read p2p_call.ini (active tab's mode/port/buffer). Never raises.
+    """Read p2p_call.ini (whole-UI snapshot). Never raises.
 
     Returns {} when the file is missing or invalid; values are range-checked.
     """
@@ -188,34 +223,43 @@ def load_config() -> dict:
         mode = cp.get(CONFIG_SECTION, "mode", fallback="").strip().lower()
         if mode in ("host", "peer"):
             cfg["mode"] = mode
-        try:
-            port = cp.getint(CONFIG_SECTION, "port", fallback=-1)
-        except ValueError:
-            port = -1
-        if 1 <= port <= 65535:
-            cfg["port"] = port
-        try:
-            buffer = cp.getint(CONFIG_SECTION, "buffer", fallback=-1)
-        except ValueError:
-            buffer = -1
-        if 1 <= buffer <= 64:
-            cfg["buffer"] = buffer
-        address = cp.get(CONFIG_SECTION, "address", fallback="").strip()
-        if address:
-            cfg["address"] = address
+        for key in ("host_port", "peer_port", "port"):
+            v = _get_valid_int(cp, key, 1, 65535)
+            if v is not None:
+                cfg[key] = v
+        # Back-compat: old files stored a single "port" for the active tab.
+        if "port" in cfg:
+            cfg.setdefault("host_port" if cfg.get("mode") != "peer" else "peer_port", cfg.pop("port"))
+        v = _get_valid_int(cp, "buffer", 1, 64)
+        if v is not None:
+            cfg["buffer"] = v
+        v = _get_valid_int(cp, "volume", 0, 200)
+        if v is not None:
+            cfg["volume"] = v
+        for key in ("address", "peer_address", "password"):
+            s = cp.get(CONFIG_SECTION, key, fallback="").strip()
+            if s:
+                cfg[key] = s
+        # Back-compat: old files stored the peer address as "address".
+        if "address" in cfg:
+            cfg.setdefault("peer_address", cfg.pop("address"))
     except Exception:
         return {}
     return cfg
 
 
-def save_config(mode: str, port: int, buffer: int, address: str = "") -> bool:
-    """Persist the active tab's settings. Returns False on write failure."""
+def save_config(mode: str, host_port: int, peer_address: str, peer_port: int,
+                buffer: int, volume: int, password: str = "") -> bool:
+    """Persist the whole-UI snapshot. Returns False on write failure."""
     cp = configparser.ConfigParser()
     cp[CONFIG_SECTION] = {
         "mode": mode,
-        "port": str(port),
+        "host_port": str(host_port),
+        "peer_address": peer_address,
+        "peer_port": str(peer_port),
         "buffer": str(buffer),
-        "address": address,
+        "volume": str(volume),
+        "password": password,
     }
     try:
         with open(_config_path(), "w", encoding="utf-8") as f:
@@ -449,24 +493,31 @@ class JitterBuffer:
 class P2PCall:
     def __init__(self, mode: str, port: int = DEFAULT_PORT,
                  address: str = "127.0.0.1", frame_buffer: int = DEFAULT_BUFFER,
+                 password: str = "", volume: float = 1.0,
                  log=None):
         assert mode in ("host", "peer")
         self.mode = mode
         self.port = int(port)
         self.address = address
         self.frame_buffer = max(1, int(frame_buffer))
+        self.password = password or ""
+        # Receive-volume gain (0.0-2.0). Written by the UI thread, read by the
+        # audio thread; plain float assignment is atomic under the GIL.
+        self.volume = max(0.0, min(2.0, float(volume)))
         self.log = log or (lambda *a: None)
         self.sock: socket.socket | None = None
         self.peer_addr = None       # Host: learned; Peer: destination (updated on reply)
         self.dest = None            # Peer only
         self.jitter = JitterBuffer(self.frame_buffer)
         self.codec: OpusCodec | None = None
+        self._aesgcm = None         # AESGCM instance when password set, else None
         self.stream = None
         self._stop = threading.Event()
         self._recv_thread: threading.Thread | None = None
         self._send_seq = 0
         self.sent = 0
         self.send_errors = 0
+        self.decrypt_errors = 0
         # Audio FIFOs (int16 mono samples). Accessed only from audio callback thread.
         self._in_fifo = None   # numpy array
         self._out_fifo = None
@@ -527,11 +578,24 @@ class P2PCall:
         self._in_fifo = np.zeros(0, dtype=np.int16)
         self._out_fifo = np.zeros(0, dtype=np.int16)
         self.codec = OpusCodec(BITRATE)
+        if self.password:
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            except ImportError as ex:
+                raise RuntimeError(
+                    "Encryption needs the 'cryptography' package. "
+                    "Run: pip install cryptography"
+                ) from ex
+            self._aesgcm = AESGCM(derive_opus_key(self.password))
+        else:
+            self._aesgcm = None
         self._setup_socket()
         self.jitter.set_maxlen(self.frame_buffer)
         self.jitter.reset()
         self._send_seq = 0
         self.sent = 0
+        self.send_errors = 0
+        self.decrypt_errors = 0
         self._stop.clear()
 
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True,
@@ -560,7 +624,9 @@ class P2PCall:
             raise
         self.log(
             f"Started {self.mode} opus={self.codec.actual_bitrate}bps "
-            f"vbr={self.codec.actual_vbr} fsize={FRAME_SIZE} fb={self.frame_buffer}"
+            f"vbr={self.codec.actual_vbr} fsize={FRAME_SIZE} fb={self.frame_buffer} "
+            f"enc={'on' if self._aesgcm is not None else 'off'} "
+            f"vol={int(round(self.volume * 100))}%"
         )
 
     def stop(self):
@@ -595,9 +661,11 @@ class P2PCall:
     # -- network recv -----------------------------------------------------
     def _recv_loop(self):
         assert self.sock is not None
+        aes = self._aesgcm  # fixed for the life of the call
         while not self._stop.is_set():
             try:
-                data, addr = self.sock.recvfrom(MAX_OPUS_BYTES + SEQ_STRUCT.size)
+                data, addr = self.sock.recvfrom(
+                    MAX_OPUS_BYTES + SEQ_STRUCT.size + GCM_TAG_LEN)
             except socket.timeout:
                 self.jitter.idle_reset_if_stale()
                 continue
@@ -610,6 +678,17 @@ class P2PCall:
                 continue
             seq = SEQ_STRUCT.unpack_from(data, 0)[0]
             payload = bytes(data[SEQ_STRUCT.size:])
+            if aes is not None:
+                # Encrypted: payload = ciphertext + 16-byte GCM tag.
+                if len(payload) < 1 + GCM_TAG_LEN:
+                    continue
+                try:
+                    payload = bytes(aes.decrypt(
+                        gcm_nonce(seq), payload, SEQ_STRUCT.pack(seq)))
+                except Exception:
+                    # Wrong password, tampered or spliced packet: drop it.
+                    self.decrypt_errors += 1
+                    continue
             # Learn / track peer.
             if self.mode == "host":
                 if self.peer_addr != addr:
@@ -643,6 +722,7 @@ class P2PCall:
             in_fifo = np_mod.concatenate([in_fifo, mono_in]) if len(in_fifo) else mono_in.copy()
             dest = self.peer_addr  # snapshot; may be None on host before first pkt
             sock = self.sock
+            aes = self._aesgcm  # fixed for the life of the call
             while len(in_fifo) >= FRAME_SIZE:
                 frame = in_fifo[:FRAME_SIZE]
                 in_fifo = in_fifo[FRAME_SIZE:]
@@ -652,8 +732,14 @@ class P2PCall:
                     opus = codec.encode_frame(frame.tobytes())
                 except Exception:
                     continue
+                seq = self._send_seq & SEQ_MASK
                 try:
-                    pkt = SEQ_STRUCT.pack(self._send_seq & SEQ_MASK) + opus
+                    if aes is None:
+                        pkt = SEQ_STRUCT.pack(seq) + opus
+                    else:
+                        # AES-256-GCM the opus frame; tag appended to ciphertext.
+                        enc = aes.encrypt(gcm_nonce(seq), opus, SEQ_STRUCT.pack(seq))
+                        pkt = SEQ_STRUCT.pack(seq) + enc
                 except Exception:
                     continue
                 try:
@@ -666,8 +752,10 @@ class P2PCall:
                 self._send_seq = (self._send_seq + 1) & SEQ_MASK
             self._in_fifo = in_fifo
 
-            # --- jitter -> decode -> play ---
+            # --- jitter -> decode -> play (shared receive-volume gain) ---
             need = int(frames)
+            gain = self.volume
+            apply_gain = gain != 1.0
             while len(out_fifo) < need:
                 payload = self.jitter.pull()
                 if payload is None:
@@ -687,6 +775,10 @@ class P2PCall:
                             chunk = np_mod.frombuffer(raw, dtype=np_mod.int16).copy()
                         except Exception:
                             chunk = np_mod.zeros(FRAME_SIZE, dtype=np_mod.int16)
+                if apply_gain and len(chunk):
+                    chunk = np_mod.clip(
+                        chunk.astype(np_mod.float32) * gain,
+                        -32768, 32767).astype(np_mod.int16)
                 out_fifo = np_mod.concatenate([out_fifo, chunk]) if len(out_fifo) else chunk
             outdata[:, 0] = out_fifo[:need]
             if outdata.shape[1] > 1:
@@ -713,6 +805,7 @@ class P2PCall:
             "dropped_overflow": js.dropped_overflow,
             "skipped_gap": js.skipped_gap,
             "underflows": js.underflows,
+            "decrypt_errors": self.decrypt_errors,
             "peer": str(self.peer_addr),
         }
 
@@ -792,19 +885,16 @@ def run_gui() -> int:
     nb.add(host_frame, text="Host")
     nb.add(peer_frame, text="Peer")
 
-    # Host tab
+    # Host tab (connection identity only; buffer/password/volume are shared)
     ttk.Label(host_frame, text="Port:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
     host_port = tk.StringVar(value=str(DEFAULT_PORT))
     ttk.Entry(host_frame, textvariable=host_port, width=10).grid(row=0, column=1, sticky="w", padx=4, pady=4)
-    ttk.Label(host_frame, text="Frame buffer:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-    host_fb = tk.StringVar(value=str(DEFAULT_BUFFER))
-    ttk.Spinbox(host_frame, from_=1, to=64, textvariable=host_fb, width=8).grid(row=1, column=1, sticky="w", padx=4, pady=4)
     host_btn = ttk.Button(host_frame, text="Start")
-    host_btn.grid(row=2, column=0, columnspan=2, pady=8, sticky="ew")
+    host_btn.grid(row=1, column=0, columnspan=2, pady=8, sticky="ew")
     host_status = ttk.Label(host_frame, text="Stopped")
-    host_status.grid(row=3, column=0, columnspan=2, sticky="w")
+    host_status.grid(row=2, column=0, columnspan=2, sticky="w")
     host_stats = ttk.Label(host_frame, text="", font=("TkDefaultFont", 8))
-    host_stats.grid(row=4, column=0, columnspan=2, sticky="w")
+    host_stats.grid(row=3, column=0, columnspan=2, sticky="w")
 
     # Peer tab
     ttk.Label(peer_frame, text="Address:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
@@ -813,17 +903,47 @@ def run_gui() -> int:
     ttk.Label(peer_frame, text="Port:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
     peer_port = tk.StringVar(value=str(DEFAULT_PORT))
     ttk.Entry(peer_frame, textvariable=peer_port, width=10).grid(row=1, column=1, sticky="w", padx=4, pady=4)
-    ttk.Label(peer_frame, text="Frame buffer:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
-    peer_fb = tk.StringVar(value=str(DEFAULT_BUFFER))
-    ttk.Spinbox(peer_frame, from_=1, to=64, textvariable=peer_fb, width=8).grid(row=2, column=1, sticky="w", padx=4, pady=4)
     ttk.Label(peer_frame, text="Tip: address may be 'host' or 'host:port'.",
-              font=("TkDefaultFont", 8)).grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
+              font=("TkDefaultFont", 8)).grid(row=2, column=0, columnspan=2, sticky="w", padx=4)
     peer_btn = ttk.Button(peer_frame, text="Start")
-    peer_btn.grid(row=4, column=0, columnspan=2, pady=8, sticky="ew")
+    peer_btn.grid(row=3, column=0, columnspan=2, pady=8, sticky="ew")
     peer_status = ttk.Label(peer_frame, text="Stopped")
-    peer_status.grid(row=5, column=0, columnspan=2, sticky="w")
+    peer_status.grid(row=4, column=0, columnspan=2, sticky="w")
     peer_stats = ttk.Label(peer_frame, text="", font=("TkDefaultFont", 8))
-    peer_stats.grid(row=6, column=0, columnspan=2, sticky="w")
+    peer_stats.grid(row=5, column=0, columnspan=2, sticky="w")
+
+    # ---- shared settings: receive volume, frame buffer, password ----
+    # Changing password/buffer takes effect on Stop + Start; volume is live.
+    shared_frame = ttk.Frame(root, padding=(10, 0))
+    shared_frame.pack(fill="x", padx=0, pady=(0, 8))
+    ttk.Label(shared_frame, text="Volume:").grid(row=0, column=0, sticky="e", padx=4)
+    shared_vol = tk.IntVar(value=DEFAULT_VOLUME)
+    vol_scale = ttk.Scale(shared_frame, from_=0, to=200, variable=shared_vol,
+                          orient="horizontal", length=130)
+    vol_scale.grid(row=0, column=1, sticky="w", padx=4)
+    vol_val = ttk.Label(shared_frame, text=f"{DEFAULT_VOLUME}%", width=5)
+    vol_val.grid(row=0, column=2, sticky="w")
+    ttk.Label(shared_frame, text="Buffer:").grid(row=0, column=3, sticky="e", padx=4)
+    shared_fb = tk.StringVar(value=str(DEFAULT_BUFFER))
+    ttk.Spinbox(shared_frame, from_=1, to=64, textvariable=shared_fb, width=5).grid(
+        row=0, column=4, sticky="w", padx=4)
+    ttk.Label(shared_frame, text="Password:").grid(row=0, column=5, sticky="e", padx=4)
+    shared_pw = tk.StringVar(value="")
+    ttk.Entry(shared_frame, textvariable=shared_pw, show="*", width=14).grid(
+        row=0, column=6, sticky="w", padx=4)
+
+    def _apply_volume(*_args):
+        try:
+            v = int(shared_vol.get())
+        except (ValueError, tk.TclError):
+            return
+        v = max(0, min(200, v))
+        vol_val.config(text=f"{v}%")
+        c = calls["active"]
+        if c is not None and c.running:
+            c.volume = v / 100.0
+
+    shared_vol.trace_add("write", _apply_volume)
 
     log_box = tk.Text(root, height=6, width=60, state="disabled", font=("TkDefaultFont", 8))
     log_box.pack(fill="both", padx=8, pady=(0, 8))
@@ -846,7 +966,7 @@ def run_gui() -> int:
                 txt = (f"peer={s['peer']} sent={s['sent']} recv={s['received']} "
                        f"played={s['played']} late={s['dropped_late']} "
                        f"ovf={s['dropped_overflow']} skip={s['skipped_gap']} "
-                       f"und={s['underflows']}")
+                       f"und={s['underflows']} dec={s['decrypt_errors']}")
                 if c.mode == "host":
                     host_stats.config(text=txt)
                 else:
@@ -864,14 +984,16 @@ def run_gui() -> int:
             stop_active()
         try:
             p = int(host_port.get().strip())
-            fb = int(host_fb.get().strip())
-        except ValueError:
-            messagebox.showerror("Host", "Port and frame buffer must be integers")
+            fb = int(shared_fb.get().strip())
+            vol = int(shared_vol.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Host", "Port, buffer and volume must be integers")
             return
-        if not (1 <= p <= 65535 and 1 <= fb <= 64):
-            messagebox.showerror("Host", "Port 1-65535, frame buffer 1-64")
+        if not (1 <= p <= 65535 and 1 <= fb <= 64 and 0 <= vol <= 200):
+            messagebox.showerror("Host", "Port 1-65535, buffer 1-64, volume 0-200")
             return
-        call = P2PCall("host", port=p, frame_buffer=fb, log=log)
+        call = P2PCall("host", port=p, frame_buffer=fb,
+                       password=shared_pw.get(), volume=vol / 100.0, log=log)
         try:
             call.start()
         except Exception as ex:
@@ -886,7 +1008,7 @@ def run_gui() -> int:
         host_btn.config(text="Stop")
         peer_btn.config(text="Start", state="disabled")
         host_status.config(text=f"Hosting on :{p} (fb={fb}) — waiting for peer…")
-        if not save_config("host", p, fb):
+        if not _save_ui_snapshot("host"):
             log("Could not save p2p_call.ini")
 
     def on_peer_toggle():
@@ -911,17 +1033,19 @@ def run_gui() -> int:
                 except ValueError as ex:
                     messagebox.showerror("Peer", str(ex))
                     return
-            fb = int(peer_fb.get().strip())
-        except ValueError:
-            messagebox.showerror("Peer", "Port / frame buffer must be integers")
+            fb = int(shared_fb.get().strip())
+            vol = int(shared_vol.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Peer", "Port / buffer / volume must be integers")
             return
-        if not (1 <= pp <= 65535 and 1 <= fb <= 64):
-            messagebox.showerror("Peer", "Port 1-65535, frame buffer 1-64")
+        if not (1 <= pp <= 65535 and 1 <= fb <= 64 and 0 <= vol <= 200):
+            messagebox.showerror("Peer", "Port 1-65535, buffer 1-64, volume 0-200")
             return
         if not host:
             messagebox.showerror("Peer", "Address is empty")
             return
-        call = P2PCall("peer", port=pp, address=host, frame_buffer=fb, log=log)
+        call = P2PCall("peer", port=pp, address=host, frame_buffer=fb,
+                       password=shared_pw.get(), volume=vol / 100.0, log=log)
         try:
             call.start()
         except Exception as ex:
@@ -936,42 +1060,55 @@ def run_gui() -> int:
         peer_btn.config(text="Stop")
         host_btn.config(text="Start", state="disabled")
         peer_status.config(text=f"Calling {host}:{pp} (fb={fb})…")
-        if not save_config("peer", pp, fb, host):
+        if not _save_ui_snapshot("peer"):
             log("Could not save p2p_call.ini")
 
     host_btn.config(command=on_host_toggle)
     peer_btn.config(command=on_peer_toggle)
 
-    # ---- restore last session (active tab's mode/port/buffer) ----
+    def _save_ui_snapshot(mode: str) -> bool:
+        """Persist the whole-UI snapshot. Returns False on invalid/failed write."""
+        try:
+            return save_config(
+                mode,
+                int(host_port.get().strip()),
+                peer_addr.get().strip(),
+                int(peer_port.get().strip()),
+                int(shared_fb.get().strip()),
+                int(shared_vol.get()),
+                shared_pw.get(),
+            )
+        except (ValueError, AttributeError, tk.TclError):
+            return False
+
+    # ---- restore last session (whole-UI snapshot) ----
     try:
         _cfg = load_config()
-        if _cfg.get("mode") == "host":
-            if "port" in _cfg:
-                host_port.set(str(_cfg["port"]))
-            if "buffer" in _cfg:
-                host_fb.set(str(_cfg["buffer"]))
-            nb.select(host_frame)
-        elif _cfg.get("mode") == "peer":
-            if "address" in _cfg:
-                peer_addr.set(_cfg["address"])
-            if "port" in _cfg:
-                peer_port.set(str(_cfg["port"]))
-            if "buffer" in _cfg:
-                peer_fb.set(str(_cfg["buffer"]))
+        if "host_port" in _cfg:
+            host_port.set(str(_cfg["host_port"]))
+        if "peer_address" in _cfg:
+            peer_addr.set(_cfg["peer_address"])
+        if "peer_port" in _cfg:
+            peer_port.set(str(_cfg["peer_port"]))
+        if "buffer" in _cfg:
+            shared_fb.set(str(_cfg["buffer"]))
+        if "volume" in _cfg:
+            shared_vol.set(_cfg["volume"])
+            vol_val.config(text=f"{_cfg['volume']}%")
+        if "password" in _cfg:
+            shared_pw.set(_cfg["password"])
+        if _cfg.get("mode") == "peer":
             nb.select(peer_frame)
+        elif _cfg.get("mode") == "host":
+            nb.select(host_frame)
     except Exception as ex:
         log(f"Config restore failed: {ex}")
 
     def on_close():
-        # Persist the currently visible tab's settings.
+        # Persist the whole-UI snapshot with the visible tab as mode.
         try:
-            if nb.index(nb.select()) == 0:
-                save_config("host", int(host_port.get().strip()),
-                            int(host_fb.get().strip()))
-            else:
-                save_config("peer", int(peer_port.get().strip()),
-                            int(peer_fb.get().strip()), peer_addr.get().strip())
-        except (ValueError, AttributeError):
+            _save_ui_snapshot("host" if nb.index(nb.select()) == 0 else "peer")
+        except (ValueError, AttributeError, tk.TclError):
             pass
         try:
             stop_active()
@@ -1000,20 +1137,29 @@ def run_cli(args) -> int:
         return 0
     # Config supplies defaults; explicit CLI flags win. Mode itself defaults
     # to the saved mode so `python p2p_call.py --cli` resumes the last session.
-    cfg = load_config() if args.mode is None or args.port is None or args.buffer is None or args.address is None else {}
+    need_cfg = (args.mode is None or args.port is None or args.buffer is None
+                or args.address is None or args.volume is None or args.password is None)
+    cfg = load_config() if need_cfg else {}
     mode = args.mode or cfg.get("mode")
-    port = args.port if args.port is not None else cfg.get("port", DEFAULT_PORT)
     buffer = args.buffer if args.buffer is not None else cfg.get("buffer", DEFAULT_BUFFER)
+    volume = args.volume if args.volume is not None else cfg.get("volume", DEFAULT_VOLUME)
+    password = args.password if args.password is not None else cfg.get("password", "")
     if args.mode == "host" or (args.mode is None and mode == "host"):
+        port = (args.port if args.port is not None
+                else cfg.get("host_port", DEFAULT_PORT))
         call = P2PCall("host", port=port, frame_buffer=buffer,
+                       password=password, volume=volume / 100.0,
                        log=lambda m: print(m, flush=True))
     elif args.mode == "peer" or (args.mode is None and mode == "peer"):
-        address = args.address or cfg.get("address")
+        address = args.address or cfg.get("peer_address")
         if not address:
             print("--address required for peer mode", file=sys.stderr)
             return 2
-        host, pp = parse_peer_address(address, port)
+        default_port = (args.port if args.port is not None
+                        else cfg.get("peer_port", DEFAULT_PORT))
+        host, pp = parse_peer_address(address, default_port)
         call = P2PCall("peer", port=pp, address=host, frame_buffer=buffer,
+                       password=password, volume=volume / 100.0,
                        log=lambda m: print(m, flush=True))
     else:
         print("No --mode given; launching GUI...", flush=True)
@@ -1031,7 +1177,7 @@ def run_cli(args) -> int:
             s = call.get_stats()
             print(f"\rpeer={s['peer']} sent={s['sent']} recv={s['received']} "
                   f"played={s['played']} late={s['dropped_late']} skip={s['skipped_gap']} "
-                  f"und={s['underflows']}", end="", flush=True)
+                  f"und={s['underflows']} dec={s['decrypt_errors']}", end="", flush=True)
     except KeyboardInterrupt:
         print("\nStopping...", flush=True)
     finally:
@@ -1047,6 +1193,10 @@ def main(argv=None) -> int:
     ap.add_argument("--address", default=None, help="Peer: host or host:port")
     ap.add_argument("--buffer", type=int, default=None,
                     help=f"Frame buffer in frames (default: saved value or {DEFAULT_BUFFER})")
+    ap.add_argument("--volume", type=int, default=None,
+                    help=f"Receive volume 0-200%% (default: saved value or {DEFAULT_VOLUME})")
+    ap.add_argument("--password", default=None,
+                    help="Shared password for AES-256-GCM (default: saved value or none)")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--cli", action="store_true", help="Force CLI even if GUI available")
     ns = ap.parse_args(argv)
