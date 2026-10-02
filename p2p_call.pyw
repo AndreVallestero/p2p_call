@@ -2,7 +2,7 @@
 """p2p_call.py — minimal full-duplex P2P voice call over UDP with Opus LOWDELAY.
 
 Requirements (Windows + Linux, minimal deps):
-    pip install sounddevice numpy opuslib
+    pip install sounddevice numpy opuslib cryptography
     # Linux may also need: sudo apt install python3-tk libportaudio2 libopus0
     # Windows needs opus.dll (libopus) somewhere on PATH or next to this file.
 
