@@ -100,7 +100,7 @@ def _ensure_opus_dll() -> str | None:
                                          "libopus.dll", "libopus-0.dll"):
                     return _found
                 try:
-                    return _orig(name) or _found
+                    return _orig(name)
                 except Exception:
                     return _found
             ctypes.util.find_library = _patched_find  # type: ignore[method-assign]
