@@ -1,6 +1,6 @@
 # p2p_call
 
-Minimal full-duplex P2P voice call over UDP with Opus LOWDELAY (2.5 ms frames, mono, hard CBR 98304 bps). Tkinter UI with Host / Peer modes, shared receive volume (0-200%), frame buffer and optional AES-256-GCM password (stored plaintext in `p2p_call.ini`).
+Minimal full-duplex P2P voice call over UDP with Opus LOWDELAY (2.5 ms frames, mono, hard CBR 131072 bps). Tkinter UI with Host / Peer modes, shared receive volume (0-200%), frame buffer and optional AES-256-GCM password (stored plaintext in `p2p_call.ini`).
 
 ## Install
 
