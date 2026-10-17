@@ -1083,7 +1083,7 @@ def run_gui() -> int:
             root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
-    log("Ready. Bitrate=98304 hard-CBR, 48kHz mono, 2.5ms LOWDELAY.")
+    log("Ready. Bitrate=131072 hard-CBR, 48kHz mono, 2.5ms LOWDELAY.")
     root.after(250, append_log)
     root.mainloop()
     return 0
