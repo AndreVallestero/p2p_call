@@ -11,7 +11,7 @@ Spec:
     Host: port (default 8192), frame buffer (default 8), start/stop.
     Peer: address + port (default 8192), frame buffer (default 8), start/stop.
   - Opus: APPLICATION_RESTRICTED_LOWDELAY, 2.5 ms frames (120 samples @48kHz),
-    mono, hard CBR (VBR=0), bitrate 98304.
+    mono, hard CBR (VBR=0), bitrate 131072.
   - Network: 1 Opus frame per UDP packet, sent immediately (tiny SO_SNDBUF,
     one sendto per frame, no send queue). Packet = BE uint32 seq + opus payload.
     Receiver skips out-of-order frames whose playback time has passed.
